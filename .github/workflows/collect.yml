@@ -7,6 +7,7 @@ on:
 
 permissions:
   contents: write
+  actions: write
 
 concurrency:
   group: monbetsu-collect
@@ -22,6 +23,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           persist-credentials: true
+          fetch-depth: 0
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -31,20 +33,41 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install requests pandas beautifulsoup4
+          pip install requests pandas beautifulsoup4 lxml
 
       - name: Collect race results
         env:
-          MAX_RUN_MINUTES: '55'
-          WAIT_SECONDS: '1.8'
+          MAX_RUN_MINUTES: '48'
+          WAIT_SECONDS: '0.6'
         run: |
           python collect.py
 
       - name: Save collected data
-        if: always()
+        shell: bash
         run: |
+          set -euo pipefail
+
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          python - <<'PY'
+          import pandas as pd
+          from pathlib import Path
+
+          path = Path("results.csv")
+
+          if path.exists():
+              df = pd.read_csv(path, encoding="utf-8-sig", low_memory=False)
+              keys = ["開催日", "レース", "馬番"]
+
+              if all(key in df.columns for key in keys):
+                  before = len(df)
+                  df = df.drop_duplicates(keys, keep="last")
+                  df.to_csv(path, index=False, encoding="utf-8-sig")
+                  print(f"CSV重複除去: {before} → {len(df)}")
+              else:
+                  print("CSVの列名を確認できないため重複除去をスキップ")
+          PY
 
           git add -A -- \
             results.csv \
@@ -53,8 +76,38 @@ jobs:
             collection_status.json
 
           if git diff --cached --quiet; then
-            echo "No changes to commit"
-          else
-            git commit -m "Auto update Monbetsu race data"
-            git push
+            echo "保存する変更はありません"
+            exit 0
+          fi
+
+          git commit -m "Auto update Monbetsu race data"
+
+          for attempt in 1 2 3 4 5; do
+            echo "Push attempt ${attempt}/5"
+
+            git fetch origin main
+
+            if git rebase origin/main; then
+              if git push origin HEAD:main; then
+                echo "GitHubへの保存成功"
+                exit 0
+              fi
+            else
+              echo "Rebase conflict detected"
+              git rebase --abort || true
+              echo "CSVの自動統合が必要な競合のため停止"
+              exit 1
+            fi
+
+            sleep $((attempt * 5))
+          done
+
+          echo "GitHubへの保存に5回失敗しました"
+          exit 1
+
+      - name: Show collection status
+        if: always()
+        run: |
+          if [ -f collection_status.json ]; then
+            cat collection_status.json
           fi
