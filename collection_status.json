@@ -1,19 +1,13 @@
 {
-  "updated_at_utc": "2026-10-22T18:57:14.308763+00:00",
+  "updated_at_utc": "2026-10-22T19:26:43.456603+00:00",
   "next_date": "2026-10-23",
   "end_date": "2026-10-22",
   "historical_pending": false,
   "made_progress": true,
   "continue_automatically": false,
-  "added_races": 587,
-  "checked_days": 134,
+  "added_races": 36,
+  "checked_days": 3,
   "total_rows": 39168,
-  "errors": 1,
-  "issues": [
-    {
-      "date": "2026-07-23",
-      "race": 11,
-      "error": "ValueError(\"表が見つかりません: ['着順', '馬番', '馬名']\")"
-    }
-  ]
+  "errors": 0,
+  "issues": []
 }
