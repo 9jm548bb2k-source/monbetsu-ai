@@ -1,4 +1,5 @@
-"""Monbetsu result collector. Preserve and repair legacy CSV column encodings."""
+"""Monbetsu race result collector for GitHub Actions."""
+
 import json
 import os
 import random
@@ -12,85 +13,51 @@ import pandas as pd
 import requests
 from bs4 import BeautifulSoup
 
-START_DATE = date.fromisoformat(os.getenv('START_DATE', '2023-01-01'))
-END_DATE = date.fromisoformat(os.getenv('END_DATE', date.today().isoformat()))
-MAX_RUN_MINUTES = int(os.getenv('MAX_RUN_MINUTES', '55'))
-WAIT_SECONDS = float(os.getenv('WAIT_SECONDS', '0.8'))
+START_DATE = date(2023, 1, 1)
+END_DATE = date.fromisoformat(
+    os.environ.get("END_DATE", date.today().isoformat())
+)
+
+MAX_RUN_MINUTES = int(os.environ.get("MAX_RUN_MINUTES", "48"))
+WAIT_SECONDS = float(os.environ.get("WAIT_SECONDS", "0.6"))
 
 ROOT = Path(__file__).resolve().parent
-DATA, LOG, CURSOR = [
-    ROOT / name
-    for name in ('results.csv', 'v6_audit.csv', 'v6_cursor.json')
-]
-STATUS = ROOT / 'collection_status.json'
 
-BASE = 'https://www.hokkaidokeiba.net/raceinfo/'
-SESSION = requests.Session()
-SESSION.headers.update({
-    'User-Agent': 'Mozilla/5.0 (compatible; ResearchCollector/1.0)'
-})
+DATA = ROOT / "results.csv"
+LOG = ROOT / "v6_audit.csv"
+CURSOR = ROOT / "v6_cursor.json"
+STATUS = ROOT / "collection_status.json"
 
-KEYS = ['開催日', 'レース', '馬番']
+BASE = "https://www.hokkaidokeiba.net/raceinfo/"
+
+KEYS = ["開催日", "レース", "馬番"]
 
 COLUMNS = [
-    '開催日', 'レース', '馬番', '馬名', '着順',
-    '騎手', '調教師', '枠番', '性齢', '斤量',
-    '馬体重', '走破タイム', '着差',
-    '単勝オッズ', '複勝オッズ範囲'
+    "開催日",
+    "レース",
+    "馬番",
+    "馬名",
+    "着順",
+    "騎手",
+    "調教師",
+    "枠番",
+    "性齢",
+    "斤量",
+    "馬体重",
+    "走破タイム",
+    "着差",
+    "単勝オッズ",
+    "複勝オッズ範囲",
 ]
 
-
-def unmojibake(value):
-    if not isinstance(value, str):
-        return value
-
-    text = value.lstrip('\ufeff')
-
-    for _ in range(2):
-        try:
-            fixed = text.encode('latin1').decode('utf-8')
-        except (UnicodeEncodeError, UnicodeDecodeError):
-            break
-
-        if fixed == text:
-            break
-
-        text = fixed
-
-    return text
-
-
-def load_results():
-    if not DATA.exists():
-        return pd.DataFrame(columns=COLUMNS)
-
-    frame = pd.read_csv(
-        DATA,
-        encoding='utf-8-sig',
-        low_memory=False,
-        dtype={'馬番': str}
-    )
-
-    frame.columns = [
-        unmojibake(str(col))
-        for col in frame.columns
-    ]
-
-    if any(key not in frame.columns for key in KEYS):
-        raise ValueError(
-            f'CSVの必須列が見つかりません: {list(frame.columns)}。'
-            '既存データは変更していません。'
-        )
-
-    for col in ['開催日', '馬名', '騎手', '調教師']:
-        if col in frame:
-            frame[col] = frame[col].map(unmojibake)
-
-    return frame
+SESSION = requests.Session()
+SESSION.headers.update({
+    "User-Agent": "Mozilla/5.0 (compatible; ResearchCollector/1.0)"
+})
 
 
 def get_soup(url):
-    last = None
+    last_error = None
 
     for attempt in range(3):
         try:
@@ -103,30 +70,39 @@ def get_soup(url):
 
             return BeautifulSoup(
                 response.content,
-                'html.parser'
+                "html.parser"
             )
 
         except requests.RequestException as exc:
-            last = exc
+            last_error = exc
             time.sleep(2 * (attempt + 1))
 
     raise RuntimeError(
-        f'通信失敗 {url}: {last}'
+        f"通信失敗: {url}: {last_error}"
     )
 
 
-def txt(cell):
+def text(cell):
     return cell.get_text(
-        ' ',
-        strip=True
-    ).replace('\u3000', ' ')
+        " ", strip=True
+    ).replace("\u3000", " ")
+
+
+def normalize(value):
+    return re.sub(
+        r"\s+",
+        "",
+        str(value)
+    ).replace("　", "")
 
 
 def expand_table(table):
-    pending, output = {}, []
+    pending = {}
+    output = []
 
-    for tr in table.select('tr'):
-        row, col = [], 0
+    for tr in table.select("tr"):
+        row = []
+        col = 0
 
         def fill():
             nonlocal col
@@ -135,7 +111,7 @@ def expand_table(table):
                 value, left = pending[col]
                 row.append(value)
 
-                if left == 1:
+                if left <= 1:
                     del pending[col]
                 else:
                     pending[col] = (value, left - 1)
@@ -145,14 +121,19 @@ def expand_table(table):
         fill()
 
         for cell in tr.find_all(
-            ['td', 'th'],
+            ["td", "th"],
             recursive=False
         ):
             fill()
 
-            value = txt(cell)
-            rowspan = int(cell.get('rowspan', 1))
-            colspan = int(cell.get('colspan', 1))
+            value = text(cell)
+
+            colspan = int(
+                cell.get("colspan", 1)
+            )
+            rowspan = int(
+                cell.get("rowspan", 1)
+            )
 
             for _ in range(colspan):
                 row.append(value)
@@ -175,102 +156,67 @@ def expand_table(table):
     return output
 
 
-def race_links(day):
-    stamp = day.strftime('%Y%m%d')
+def find_table(soup, required):
+    required = [
+        normalize(word)
+        for word in required
+    ]
 
-    soup = get_soup(
-        BASE + f'index.php?p_day={stamp}'
-    )
+    for table in soup.select("table"):
+        rows = expand_table(table)
 
-    numbers = set()
+        if not rows:
+            continue
 
-    for anchor in soup.find_all('a', href=True):
-        url = urljoin(BASE, anchor['href'])
-        query = parse_qs(urlparse(url).query)
-
-        if (
-            'seiseki.php' in url
-            and query.get('p_day', [''])[0] == stamp
+        for index, row in enumerate(
+            rows[:5]
         ):
-            try:
-                numbers.add(
-                    int(query['p_rno'][0])
-                )
-            except (KeyError, ValueError):
-                pass
+            header = [
+                normalize(value)
+                for value in row
+            ]
 
-    return sorted(numbers)
-
-
-def race_tables(day, num):
-    query = (
-        f'p_day={day.strftime("%Y%m%d")}'
-        f'&p_rno={num:03d}'
-    )
-
-    result_page = get_soup(
-        BASE + 'seiseki.php?' + query
-    )
-
-    odds_page = get_soup(
-        BASE + 'odds/tanhuku.php?' + query
-    )
-
-    def choose(soup, words):
-        for table in soup.select('table'):
-            header = ' '.join(
-                txt(cell)
-                for cell in table.select('th')
-            )
+            combined = "".join(header)
 
             if all(
-                word in header
-                for word in words
+                word in combined
+                for word in required
             ):
-                return expand_table(table)
+                return rows[index:]
 
-        raise ValueError(
-            f'表が見つかりません: {words}'
-        )
-
-    return (
-        choose(
-            result_page,
-            ['着順', '馬番', '馬名']
-        ),
-        choose(
-            odds_page,
-            ['馬番', '単勝オッズ']
-        )
+    raise ValueError(
+        f"表が見つかりません: {required}"
     )
 
 
 def table_records(rows):
     if not rows:
-        raise ValueError('空のテーブル')
+        return []
 
     header = [
-        re.sub(r'\s+', '', item)
-        for item in rows[0]
+        normalize(value)
+        for value in rows[0]
     ]
 
-    if '負担' in header and '重量' in header:
-        index = header.index('負担')
-        header[index] = '斤量'
+    if (
+        "負担" in header
+        and "重量" in header
+    ):
+        index = header.index("負担")
+        header[index] = "斤量"
         header.pop(
-            header.index('重量')
+            header.index("重量")
         )
 
     records = []
 
     for index, row in enumerate(
-        rows[1:],
-        1
+        rows[1:], 1
     ):
         if len(row) != len(header):
             raise ValueError(
-                f'行列不一致 row={index} '
-                f'header={header} row={row}'
+                f"行列不一致: {index}, "
+                f"header={header}, row={row}"
             )
 
         records.append(
@@ -280,89 +226,176 @@ def table_records(rows):
     return records
 
 
-def parse_race(day, num):
-    result_rows, odds_rows = race_tables(
-        day,
-        num
+def race_links(day):
+    stamp = day.strftime("%Y%m%d")
+
+    soup = get_soup(
+        BASE + f"index.php?p_day={stamp}"
     )
 
-    results = table_records(result_rows)
-    odds = table_records(odds_rows)
+    numbers = set()
 
-    def number(value):
-        try:
-            return int(str(value).strip())
-        except (TypeError, ValueError):
-            return None
+    for link in soup.find_all(
+        "a", href=True
+    ):
+        url = urljoin(
+            BASE,
+            link["href"]
+        )
 
-    def decimal(value):
-        try:
-            return float(
-                str(value).replace(',', '')
+        query = parse_qs(
+            urlparse(url).query
+        )
+
+        if (
+            "seiseki.php" in url
+            and query.get(
+                "p_day", [""]
+            )[0] == stamp
+        ):
+            try:
+                numbers.add(
+                    int(
+                        query["p_rno"][0]
+                    )
+                )
+            except (
+                KeyError,
+                ValueError
+            ):
+                pass
+
+    return sorted(numbers)
+
+
+def race_tables(day, number):
+    query = (
+        f"p_day={day.strftime('%Y%m%d')}"
+        f"&p_rno={number:03d}"
+    )
+
+    result_page = get_soup(
+        BASE + "seiseki.php?" + query
+    )
+
+    odds_page = get_soup(
+        BASE + "odds/tanhuku.php?" + query
+    )
+
+    results = find_table(
+        result_page,
+        ["着順", "馬番", "馬名"]
+    )
+
+    odds = find_table(
+        odds_page,
+        ["馬番", "単勝オッズ"]
+    )
+
+    return results, odds
+
+
+def number(value):
+    try:
+        return int(
+            str(value).strip()
+        )
+    except (
+        TypeError,
+        ValueError
+    ):
+        return None
+
+
+def decimal(value):
+    try:
+        return float(
+            str(value).replace(
+                ",", ""
             )
-        except (TypeError, ValueError):
-            return None
+        )
+    except (
+        TypeError,
+        ValueError
+    ):
+        return None
 
-    odds_by_no = {
-        number(record.get('馬番')): record
-        for record in odds
-    }
+
+def parse_race(day, race):
+    result_rows, odds_rows = (
+        race_tables(day, race)
+    )
+
+    results = table_records(
+        result_rows
+    )
+
+    odds = table_records(
+        odds_rows
+    )
 
     if not results:
-        raise ValueError('結果0行')
-
-    if len(odds_by_no) < len(results) - 2:
         raise ValueError(
-            f'オッズ行不足 '
-            f'結果{len(results)} '
-            f'オッズ{len(odds_by_no)}'
+            "結果データが0行"
         )
+
+    odds_by_number = {
+        number(
+            row.get("馬番")
+        ): row
+        for row in odds
+    }
 
     output = []
 
     for record in results:
-        horse = number(
-            record.get('馬番')
+        horse_number = number(
+            record.get("馬番")
         )
 
-        if horse is None:
+        if horse_number is None:
             continue
 
-        odd = odds_by_no.get(
-            horse,
-            {}
+        odd = odds_by_number.get(
+            horse_number, {}
         )
 
         output.append({
-            '開催日': day.isoformat(),
-            'レース': num,
-            '馬番': horse,
-            '馬名': record.get('馬名'),
-            '着順': number(
-                record.get('着順')
+            "開催日": day.isoformat(),
+            "レース": race,
+            "馬番": horse_number,
+            "馬名": record.get("馬名"),
+            "着順": number(
+                record.get("着順")
             ),
-            '騎手': record.get('騎手'),
-            '調教師': record.get('調教師'),
-            '枠番': record.get('枠番'),
-            '性齢': record.get('性齢'),
-            '斤量': record.get(
-                '斤量',
-                record.get('負担重量')
+            "騎手": record.get("騎手"),
+            "調教師": record.get("調教師"),
+            "枠番": record.get("枠番"),
+            "性齢": record.get("性齢"),
+            "斤量": record.get(
+                "斤量",
+                record.get("負担重量")
             ),
-            '馬体重': record.get('馬体重'),
-            '走破タイム': record.get('タイム'),
-            '着差': record.get('着差'),
-            '単勝オッズ': decimal(
-                odd.get('単勝オッズ')
+            "馬体重": record.get(
+                "馬体重"
             ),
-            '複勝オッズ範囲': odd.get(
-                '複勝オッズ'
-            )
+            "走破タイム": record.get(
+                "タイム"
+            ),
+            "着差": record.get(
+                "着差"
+            ),
+            "単勝オッズ": decimal(
+                odd.get("単勝オッズ")
+            ),
+            "複勝オッズ範囲": odd.get(
+                "複勝オッズ"
+            ),
         })
 
     if not output:
         raise ValueError(
-            '馬番の解析失敗'
+            "馬番の解析に失敗"
         )
 
     return output
@@ -370,13 +403,13 @@ def parse_race(day, num):
 
 def atomic_csv(frame, path):
     temporary = path.with_name(
-        path.name + '.tmp'
+        path.name + ".tmp"
     )
 
     frame.to_csv(
         temporary,
         index=False,
-        encoding='utf-8-sig'
+        encoding="utf-8-sig"
     )
 
     os.replace(
@@ -385,85 +418,121 @@ def atomic_csv(frame, path):
     )
 
 
-def main():
-    old = load_results()
-    rows = old.to_dict('records')
+def atomic_json(data, path):
+    temporary = path.with_name(
+        path.name + ".tmp"
+    )
 
-    if LOG.exists():
-        audit = pd.read_csv(
-            LOG,
-            dtype=str
-        ).fillna('')
-    else:
-        audit = pd.DataFrame(
-            columns=[
-                'date',
-                'race',
-                'status',
-                'count',
-                'message'
-            ]
-        )
+    temporary.write_text(
+        json.dumps(
+            data,
+            ensure_ascii=False,
+            indent=2
+        ),
+        encoding="utf-8"
+    )
 
-    completed = set()
+    os.replace(
+        temporary,
+        path
+    )
 
-    for row in rows:
-        try:
-            completed.add((
-                str(row['開催日'])[:10],
-                int(row['レース'])
-            ))
-        except (
-            KeyError,
-            ValueError,
-            TypeError
-        ):
-            pass
 
-    for record in audit.itertuples(
-        index=False
-    ):
-        try:
-            key = (
-                str(record.date),
-                int(record.race)
-            )
-
-            if record.status == 'ok':
-                completed.add(key)
-
-            elif record.status == 'error':
-                completed.discard(key)
-
-        except (
-            ValueError,
-            AttributeError
-        ):
-            pass
-
+def load_cursor():
     try:
-        cursor = date.fromisoformat(
-            json.loads(
-                CURSOR.read_text()
-            )['next_date']
+        data = json.loads(
+            CURSOR.read_text(
+                encoding="utf-8"
+            )
         )
+
+        return date.fromisoformat(
+            data["next_date"]
+        )
+
     except (
         FileNotFoundError,
         KeyError,
         ValueError,
         json.JSONDecodeError
     ):
-        cursor = START_DATE
+        return START_DATE
+
+
+def main():
+    if DATA.exists():
+        old = pd.read_csv(
+            DATA,
+            encoding="utf-8-sig",
+            low_memory=False
+        )
+    else:
+        old = pd.DataFrame(
+            columns=COLUMNS
+        )
+
+    missing_columns = [
+        key
+        for key in KEYS
+        if key not in old.columns
+    ]
+
+    if missing_columns:
+        raise ValueError(
+            "既存CSVの必須列がありません: "
+            + str(missing_columns)
+        )
+
+    all_rows = old.to_dict(
+        "records"
+    )
+
+    if LOG.exists():
+        audit = pd.read_csv(
+            LOG,
+            dtype=str
+        ).fillna("")
+    else:
+        audit = pd.DataFrame(
+            columns=[
+                "date",
+                "race",
+                "status",
+                "count",
+                "message"
+            ]
+        )
+
+    completed = set()
+
+    for row in all_rows:
+        try:
+            completed.add((
+                str(
+                    row["開催日"]
+                )[:10],
+                int(
+                    row["レース"]
+                )
+            ))
+        except (
+            KeyError,
+            TypeError,
+            ValueError
+        ):
+            pass
 
     cursor = max(
-        cursor,
+        load_cursor(),
         START_DATE
     )
 
     if cursor > END_DATE:
         cursor = max(
             START_DATE,
-            END_DATE - timedelta(days=2)
+            END_DATE - timedelta(
+                days=2
+            )
         )
 
         completed = {
@@ -472,7 +541,7 @@ def main():
             if key[0] < cursor.isoformat()
         }
 
-    initial_cursor = cursor
+    start_cursor = cursor
     clock = time.monotonic()
     cutoff = MAX_RUN_MINUTES * 60
 
@@ -481,20 +550,16 @@ def main():
     issues = []
 
     def checkpoint(next_day):
-        nonlocal rows
+        nonlocal all_rows
 
-        frame = pd.DataFrame(rows)
+        frame = pd.DataFrame(
+            all_rows
+        )
 
         if not frame.empty:
-            for col in KEYS:
-                if col not in frame.columns:
-                    raise ValueError(
-                        f'必須列がありません: {col}'
-                    )
-
             frame = frame.drop_duplicates(
                 KEYS,
-                keep='last'
+                keep="last"
             )
 
             atomic_csv(
@@ -502,39 +567,29 @@ def main():
                 DATA
             )
 
-            rows = frame.to_dict('records')
+            all_rows = frame.to_dict(
+                "records"
+            )
 
         atomic_csv(
             audit,
             LOG
         )
 
-        temp = CURSOR.with_suffix(
-            '.json.tmp'
-        )
-
-        temp.write_text(
-            json.dumps(
-                {
-                    'next_date':
-                    next_day.isoformat()
-                },
-                ensure_ascii=False
-            ),
-            encoding='utf-8'
-        )
-
-        os.replace(
-            temp,
+        atomic_json(
+            {
+                "next_date":
+                next_day.isoformat()
+            },
             CURSOR
         )
 
     print(
-        '既存行数:',
-        len(rows),
-        '開始日:',
+        "既存行数:",
+        len(all_rows),
+        "開始日:",
         cursor,
-        '終了日:',
+        "終了日:",
         END_DATE,
         flush=True
     )
@@ -542,217 +597,192 @@ def main():
     day = cursor
 
     while day <= END_DATE:
-        if time.monotonic() - clock >= cutoff:
+        if (
+            time.monotonic() - clock
+            >= cutoff
+        ):
             break
 
         checked += 1
 
         try:
-            nums = race_links(day)
+            races = race_links(day)
 
         except Exception as exc:
-            issues.append((
-                str(day),
-                '一覧',
-                repr(exc)
-            ))
+            issues.append({
+                "date": day.isoformat(),
+                "race": "一覧",
+                "error": repr(exc)
+            })
 
+            print(
+                "開催一覧取得失敗:",
+                day,
+                repr(exc),
+                flush=True
+            )
+
+            day += timedelta(days=1)
             checkpoint(day)
-            break
+            continue
 
         remaining = [
-            num
-            for num in nums
+            race
+            for race in races
             if (
                 day.isoformat(),
-                num
+                race
             ) not in completed
         ]
 
-        failed = False
-
         if remaining:
             print(
-                '開催',
+                "開催:",
                 day,
-                '未取得',
+                "未取得:",
                 len(remaining),
                 flush=True
             )
 
-        for num in remaining:
-            if time.monotonic() - clock >= cutoff:
-                failed = True
+        for race in remaining:
+            if (
+                time.monotonic() - clock
+                >= cutoff
+            ):
                 break
 
             try:
-                new_rows = parse_race(
+                rows = parse_race(
                     day,
-                    num
+                    race
                 )
 
-                rows = [
+                all_rows = [
                     row
-                    for row in rows
+                    for row in all_rows
                     if not (
                         str(
-                            row.get('開催日')
-                        )[:10] == day.isoformat()
+                            row.get("開催日")
+                        ) == day.isoformat()
                         and str(
-                            row.get('レース')
-                        ) == str(num)
+                            row.get("レース")
+                        ) == str(race)
                     )
                 ]
 
-                rows.extend(new_rows)
+                all_rows.extend(
+                    rows
+                )
 
-                audit.loc[len(audit)] = [
+                audit.loc[
+                    len(audit)
+                ] = [
                     day.isoformat(),
-                    str(num),
-                    'ok',
-                    str(len(new_rows)),
-                    ''
+                    str(race),
+                    "ok",
+                    str(len(rows)),
+                    ""
                 ]
 
                 completed.add((
                     day.isoformat(),
-                    num
+                    race
                 ))
 
                 added += 1
 
             except Exception as exc:
-                failed = True
+                issues.append({
+                    "date": day.isoformat(),
+                    "race": race,
+                    "error": repr(exc)
+                })
 
-                issues.append((
-                    str(day),
-                    num,
-                    repr(exc)
-                ))
-
-                audit.loc[len(audit)] = [
+                audit.loc[
+                    len(audit)
+                ] = [
                     day.isoformat(),
-                    str(num),
-                    'error',
-                    '0',
+                    str(race),
+                    "error",
+                    "0",
                     repr(exc)[:400]
                 ]
 
                 print(
-                    '失敗',
+                    "取得失敗:",
                     day,
-                    num,
-                    repr(exc)[:120],
+                    race,
+                    repr(exc)[:150],
                     flush=True
                 )
 
-        next_day = (
-            day
-            if failed
-            else day + timedelta(days=1)
+        day += timedelta(
+            days=1
         )
 
-        checkpoint(next_day)
+        checkpoint(day)
 
-        if failed:
-            break
-
-        day = next_day
-
-    try:
-        final_cursor = date.fromisoformat(
-            json.loads(
-                CURSOR.read_text()
-            )['next_date']
-        )
-
-    except (
-        FileNotFoundError,
-        KeyError,
-        ValueError,
-        json.JSONDecodeError
-    ):
-        final_cursor = day
+    pending = day <= END_DATE
 
     progress = (
-        final_cursor > initial_cursor
+        day > start_cursor
         or added > 0
     )
 
     status = {
-        'updated_at_utc':
+        "updated_at_utc":
             datetime.now(
                 timezone.utc
             ).isoformat(),
-
-        'next_date':
-            final_cursor.isoformat(),
-
-        'end_date':
+        "next_date":
+            day.isoformat(),
+        "end_date":
             END_DATE.isoformat(),
-
-        'historical_pending':
-            final_cursor <= END_DATE,
-
-        'made_progress':
+        "historical_pending":
+            pending,
+        "made_progress":
             progress,
-
-        'continue_automatically':
-            final_cursor <= END_DATE
-            and progress
-            and not issues,
-
-        'added_races':
+        "continue_automatically":
+            pending and progress,
+        "added_races":
             added,
-
-        'checked_days':
+        "checked_days":
             checked,
-
-        'total_rows':
-            len(rows),
-
-        'errors':
-            len(issues)
+        "total_rows":
+            len(all_rows),
+        "errors":
+            len(issues),
+        "issues":
+            issues[:100]
     }
 
-    temp = STATUS.with_suffix(
-        '.json.tmp'
-    )
-
-    temp.write_text(
-        json.dumps(
-            status,
-            ensure_ascii=False,
-            indent=2
-        ),
-        encoding='utf-8'
-    )
-
-    os.replace(
-        temp,
+    atomic_json(
+        status,
         STATUS
     )
 
     print(
-        '今回追加レース',
+        "今回追加レース:",
         added,
-        '確認日数',
+        "確認日数:",
         checked,
-        '総行数',
-        len(rows),
-        '問題',
+        "総行数:",
+        len(all_rows),
+        "問題:",
         len(issues),
         flush=True
     )
 
     print(
-        '自動継続:',
-        status['continue_automatically'],
-        '次回開始日:',
-        final_cursor,
+        "自動継続:",
+        status[
+            "continue_automatically"
+        ],
+        "次回開始日:",
+        day,
         flush=True
     )
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
