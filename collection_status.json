@@ -1,12 +1,89 @@
 {
-  "updated_at_utc": "2026-10-22T16:22:47.161763+00:00",
-  "next_date": "2025-07-30",
+  "updated_at_utc": "2026-10-22T17:28:51.552858+00:00",
+  "next_date": "2026-06-11",
   "end_date": "2026-10-22",
   "historical_pending": true,
-  "made_progress": false,
-  "continue_automatically": false,
-  "added_races": 0,
-  "checked_days": 1,
-  "total_rows": 25303,
-  "errors": 12
+  "made_progress": true,
+  "continue_automatically": true,
+  "added_races": 764,
+  "checked_days": 316,
+  "total_rows": 33269,
+  "errors": 15,
+  "issues": [
+    {
+      "date": "2025-07-30",
+      "race": 1,
+      "error": "ValueError(\"表が見つかりません: ['着順', '馬番', '馬名']\")"
+    },
+    {
+      "date": "2025-07-30",
+      "race": 2,
+      "error": "ValueError(\"表が見つかりません: ['着順', '馬番', '馬名']\")"
+    },
+    {
+      "date": "2025-07-30",
+      "race": 3,
+      "error": "ValueError(\"表が見つかりません: ['着順', '馬番', '馬名']\")"
+    },
+    {
+      "date": "2025-07-30",
+      "race": 4,
+      "error": "ValueError(\"表が見つかりません: ['着順', '馬番', '馬名']\")"
+    },
+    {
+      "date": "2025-07-30",
+      "race": 5,
+      "error": "ValueError(\"表が見つかりません: ['着順', '馬番', '馬名']\")"
+    },
+    {
+      "date": "2025-07-30",
+      "race": 6,
+      "error": "ValueError(\"表が見つかりません: ['着順', '馬番', '馬名']\")"
+    },
+    {
+      "date": "2025-07-30",
+      "race": 7,
+      "error": "ValueError(\"表が見つかりません: ['着順', '馬番', '馬名']\")"
+    },
+    {
+      "date": "2025-07-30",
+      "race": 8,
+      "error": "ValueError(\"表が見つかりません: ['着順', '馬番', '馬名']\")"
+    },
+    {
+      "date": "2025-07-30",
+      "race": 9,
+      "error": "ValueError(\"表が見つかりません: ['着順', '馬番', '馬名']\")"
+    },
+    {
+      "date": "2025-07-30",
+      "race": 10,
+      "error": "ValueError(\"表が見つかりません: ['着順', '馬番', '馬名']\")"
+    },
+    {
+      "date": "2025-07-30",
+      "race": 11,
+      "error": "ValueError(\"表が見つかりません: ['着順', '馬番', '馬名']\")"
+    },
+    {
+      "date": "2025-07-30",
+      "race": 12,
+      "error": "ValueError(\"表が見つかりません: ['着順', '馬番', '馬名']\")"
+    },
+    {
+      "date": "2025-07-31",
+      "race": 2,
+      "error": "ValueError(\"表が見つかりません: ['馬番', '単勝オッズ']\")"
+    },
+    {
+      "date": "2026-05-21",
+      "race": 10,
+      "error": "ValueError(\"表が見つかりません: ['着順', '馬番', '馬名']\")"
+    },
+    {
+      "date": "2026-05-21",
+      "race": 12,
+      "error": "ValueError(\"表が見つかりません: ['着順', '馬番', '馬名']\")"
+    }
+  ]
 }
