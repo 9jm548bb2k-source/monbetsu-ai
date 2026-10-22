@@ -1,0 +1,12 @@
+{
+  "updated_at_utc": "2026-10-22T00:40:02.463536+00:00",
+  "next_date": "2024-05-15",
+  "end_date": "2026-10-21",
+  "historical_pending": true,
+  "made_progress": true,
+  "continue_automatically": true,
+  "added_races": 329,
+  "checked_days": 501,
+  "total_rows": 11980,
+  "errors": 0
+}
