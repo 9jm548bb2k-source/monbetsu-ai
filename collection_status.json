@@ -1,15 +1,25 @@
 {
-  "updated_at_utc": "2026-10-27T00:17:07.714721+00:00",
+  "updated_at_utc": "2026-10-27T01:32:55.068093+00:00",
   "next_date": "2026-10-28",
   "end_date": "2026-10-27",
   "historical_pending": false,
   "made_progress": true,
   "continue_automatically": false,
   "added_races": 0,
-  "checked_days": 1,
+  "checked_days": 3,
   "total_rows": 39168,
-  "errors": 1,
+  "errors": 3,
   "issues": [
+    {
+      "date": "2026-10-25",
+      "race": "一覧",
+      "error": "RuntimeError('通信失敗: https://www.hokkaidokeiba.net/raceinfo/index.php?p_day=20261025: 503 Server Error: Service Unavailable for url: https://www.hokkaidokeiba.net/raceinfo/index.php?p_day=20261025')"
+    },
+    {
+      "date": "2026-10-26",
+      "race": "一覧",
+      "error": "RuntimeError('通信失敗: https://www.hokkaidokeiba.net/raceinfo/index.php?p_day=20261026: 503 Server Error: Service Unavailable for url: https://www.hokkaidokeiba.net/raceinfo/index.php?p_day=20261026')"
+    },
     {
       "date": "2026-10-27",
       "race": "一覧",
