@@ -1,0 +1,374 @@
+name: Monbetsu NAR v2
+
+on:
+  workflow_dispatch:
+    inputs:
+      start_month:
+        description: '門別本体の開始月（YYYY-MM）'
+        default: '2023-01'
+      history_start_month:
+        description: '過去走の収集開始月（YYYY-MM）'
+        default: '2022-01'
+      as_of_date:
+        description: '最終日（YYYY-MM-DD）。空欄なら日本時間の前日'
+        default: ''
+
+permissions:
+  contents: read
+
+concurrency:
+  group: monbetsu-nar-v2
+  cancel-in-progress: false
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 55
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - uses: actions/cache/restore@v4
+        with:
+          path: .nar-cache-v2
+          key: monbetsu-nar-v2-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: monbetsu-nar-v2-
+      - name: Collect official data
+        env:
+          START_MONTH: ${{ inputs.start_month }}
+          HISTORY_START_MONTH: ${{ inputs.history_start_month }}
+          AS_OF_DATE: ${{ inputs.as_of_date }}
+        run: |
+          python -u - <<'PY'
+          import csv, hashlib, io, json, os, re, time, unicodedata, zipfile
+          from collections import Counter
+          from concurrent.futures import ThreadPoolExecutor
+          from datetime import date, datetime, timedelta, timezone
+          from pathlib import Path
+          from urllib.parse import urlencode
+          from urllib.request import Request, urlopen
+
+          ROOT = Path.cwd()
+          CACHE = ROOT / '.nar-cache-v2'
+          OUT = ROOT / 'output'
+          JST = timezone(timedelta(hours=9))
+          KEY = ['競馬場', '競走年月日', 'レース番号']
+          ODDS = KEY + ['賭式', '番号1', '番号2', '番号3', 'オッズ', 'オッズ（最大）', '人気']
+          LIMIT = 150 * 1024 ** 2
+          DEADLINE = time.monotonic() + 35 * 60
+
+          def save_json(path, value):
+              path.parent.mkdir(parents=True, exist_ok=True)
+              tmp = path.with_suffix('.tmp')
+              tmp.write_text(json.dumps(value, ensure_ascii=False, indent=2))
+              os.replace(tmp, path)
+
+          def norm(value):
+              return re.sub(r'\s+', '', unicodedata.normalize('NFKC', str(value)))
+
+          def identity(h):
+              parts = [norm(h.get(k, '')) for k in ['馬名', '生年月日', '父馬名', '母馬名']]
+              valid = all(parts) and bool(re.fullmatch(r'\d{8}', parts[1]))
+              if not valid:
+                  parts += [h[k] for k in KEY + ['馬番']]
+              return hashlib.sha256(json.dumps(parts, ensure_ascii=False).encode()).hexdigest()[:24], valid
+
+          def months(start, end):
+              a, b = date.fromisoformat(start + '-01'), date.fromisoformat(end + '-01')
+              if a < date(1998, 1, 1) or a > b:
+                  raise ValueError('月の指定が不正です')
+              result = []
+              while a <= b:
+                  result.append(a.strftime('%Y%m'))
+                  a = date(a.year + (a.month == 12), a.month % 12 + 1, 1)
+              if len(result) > 120:
+                  raise ValueError('120か月以内で指定してください')
+              return result
+
+          def records(path, kind):
+              with zipfile.ZipFile(path) as z:
+                  names = [n for n in z.namelist() if n.endswith('_' + kind + '.csv')]
+                  if not names or (kind != 'odds' and len(names) != 1):
+                      raise ValueError(f'{path.name}: {kind}がありません')
+                  for name in sorted(names):
+                      with z.open(name) as raw:
+                          reader = csv.DictReader(io.TextIOWrapper(raw, encoding='utf-8-sig', newline=''))
+                          required = KEY + ({
+                              'horselist': ['馬番', '馬名', '生年月日', '父馬名', '母馬名', '着順', 'タイム'],
+                              'racelist': ['距離', 'レース名', '馬場'],
+                              'payback': [],
+                              'odds': ODDS
+                          }[kind])
+                          if not reader.fieldnames or len(set(reader.fieldnames)) != len(reader.fieldnames) or not set(required) <= set(reader.fieldnames):
+                              raise ValueError(f'{name}: ヘッダー不一致')
+                          for r in reader:
+                              if None in r or any(v is None for v in r.values()):
+                                  raise ValueError(f'{name}: 行列不一致')
+                              if not re.fullmatch(r'\d{8}', r['競走年月日']) or not all(r[k] for k in KEY):
+                                  raise ValueError(f'{name}: キー不正')
+                              yield r
+
+          def fetch(m, kind, refresh_from):
+              path = CACHE / f'{m}_{kind}.zip'
+              meta_path = path.with_suffix('.json')
+              meta = json.loads(meta_path.read_text()) if meta_path.exists() else {}
+              today = datetime.now(JST).date().isoformat()
+              if path.exists() and meta.get('sha256') == hashlib.sha256(path.read_bytes()).hexdigest():
+                  if m < refresh_from or meta.get('fetched_at', '')[:10] == today:
+                      return path, meta
+              endpoint = 'RaceDataDownload' if kind == 'race' else 'OddsDataDownload'
+              url = 'https://www.keiba.go.jp/KeibaWeb/DataDownload/' + endpoint + '?' + urlencode({
+                  'type': 'monthly',
+                  'k_year': int(m[:4]),
+                  'k_month': int(m[4:])
+              })
+              for attempt in range(3):
+                  try:
+                      if time.monotonic() >= DEADLINE:
+                          raise TimeoutError('35分上限。キャッシュから次回再開してください')
+                      request = Request(url, headers={'User-Agent': 'MonbetsuResearch/2.0'})
+                      with urlopen(request, timeout=45) as response:
+                          data = response.read(LIMIT + 1)
+                      if len(data) > LIMIT:
+                          raise ValueError('ZIPが150MiBを超えました')
+                      tmp = path.with_suffix('.download')
+                      tmp.write_bytes(data)
+                      with zipfile.ZipFile(tmp) as z:
+                          if len(z.infolist()) > 10 or sum(n.file_size for n in z.infolist()) > 1024 ** 3 or z.testzip():
+                              raise ValueError('ZIP構成・CRCが不正です')
+                      kinds = ['racelist', 'horselist', 'payback'] if kind == 'race' else ['odds']
+                      for k in kinds:
+                          next(records(tmp, k), None)
+                      os.replace(tmp, path)
+                      meta = {
+                          'url': url,
+                          'fetched_at': datetime.now(JST).isoformat(),
+                          'sha256': hashlib.sha256(data).hexdigest()
+                      }
+                      save_json(meta_path, meta)
+                      print(m, kind, '取得完了', flush=True)
+                      return path, meta
+                  except Exception:
+                      if attempt == 2:
+                          raise
+                      time.sleep(2 * (attempt + 1))
+
+          def write_csv(path, rows, fields):
+              with path.open('w', encoding='utf-8-sig', newline='') as f:
+                  writer = csv.DictWriter(f, fields)
+                  writer.writeheader()
+                  writer.writerows(rows)
+
+          def clock(s):
+              if not s:
+                  return ''
+              if not s.isdigit() or len(s) > 5 or (int(s) // 10) % 100 >= 60:
+                  raise ValueError('未知の走破タイム: ' + s)
+              n = int(s)
+              return round(n // 1000 * 60 + n % 1000 / 10, 1)
+
+          def main():
+              CACHE.mkdir(exist_ok=True)
+              OUT.mkdir(exist_ok=True)
+              today = datetime.now(JST).date()
+              cutoff = date.fromisoformat(os.getenv('AS_OF_DATE') or (today - timedelta(days=1)).isoformat())
+              start = os.getenv('START_MONTH') or '2023-01'
+              history = os.getenv('HISTORY_START_MONTH') or '2022-01'
+              end = os.getenv('END_MONTH') or cutoff.strftime('%Y-%m')
+              if cutoff >= today or history > start or end > cutoff.strftime('%Y-%m'):
+                  raise ValueError('前日以前、履歴開始月≦本体開始月≦終了月を指定してください')
+              months(start, end)
+              wanted = months(history, end)
+              lower, upper = start.replace('-', '') + '01', cutoff.strftime('%Y%m%d')
+              refresh_from = (today.replace(day=1) - timedelta(days=1)).strftime('%Y%m')
+              with ThreadPoolExecutor(max_workers=2) as ex:
+                  downloaded = list(ex.map(lambda m: fetch(m, 'race', refresh_from), wanted))
+              sources = {m: meta for m, (_, meta) in zip(wanted, downloaded)}
+              targets = {}
+              for path, _ in downloaded:
+                  for h in records(path, 'horselist'):
+                      if h['競馬場'] == '門別' and lower <= h['競走年月日'] <= upper:
+                          hid, valid = identity(h)
+                          if valid:
+                              targets[hid] = max(targets.get(hid, ''), h['競走年月日'])
+              rows, seen, race_keys, pays = [], set(), set(), []
+              raw_fields = set()
+              for path, _ in downloaded:
+                  races = {}
+                  for r in records(path, 'racelist'):
+                      key = tuple(r[k] for k in KEY)
+                      if key in races:
+                          raise ValueError('レース重複: ' + str(key))
+                      races[key] = r
+                      raw_fields.update('公式レース_' + k for k in r)
+                  for h in records(path, 'horselist'):
+                      raw_fields.update('公式出走_' + k for k in h)
+                      d = h['競走年月日']
+                      hid, valid = identity(h)
+                      is_main = h['競馬場'] == '門別' and lower <= d <= upper
+                      if not is_main and not (valid and hid in targets and d <= min(upper, targets[hid])):
+                          continue
+                      key = tuple(h[k] for k in KEY)
+                      uid = key + (h['馬番'],)
+                      if uid in seen or key not in races:
+                          raise ValueError('出走重複・レース情報欠落: ' + str(uid))
+                      seen.add(uid)
+                      if is_main:
+                          race_keys.add(key)
+                      r = races[key]
+                      row = {
+                          '記録ID': '_'.join(uid),
+                          '馬ID': hid,
+                          '日付': f'{d[:4]}-{d[4:6]}-{d[6:]}',
+                          '競馬場': h['競馬場'],
+                          'レース番号': h['レース番号'],
+                          '馬番': h['馬番'],
+                          '馬名': h['馬名'],
+                          'データ区分': '門別本体' if is_main else '追加過去走',
+                          '馬ID方式': '馬名+生年月日+父+母' if valid else '情報不足・当該出走のみ',
+                          '走破秒': clock(h['タイム']),
+                          '単勝オッズ': '',
+                          '複勝下限': '',
+                          '複勝上限': '',
+                          'オッズ時点': '',
+                          'オッズ出典': ''
+                      }
+                      race_map = {
+                          '距離m':'距離', '馬場':'馬場', '天候':'天候', '回り':'回り',
+                          '芝ダート':'芝ダート区分', 'レース名':'レース名',
+                          '競走条件':'条件', '頭数':'頭数', '発走時刻':'発走時刻',
+                          'レース上がり3F':'上がり3F', 'レース上がり4F':'上がり4F'
+                      }
+                      horse_map = {
+                          '着順':'着順', '着差':'着差', '騎手名':'騎手名', '調教師名':'調教師',
+                          '枠番':'枠番', '性':'性', '齢':'齢', '生年月日':'生年月日',
+                          '父馬名':'父馬名', '母馬名':'母馬名', '母父馬名':'母父馬名',
+                          '負担重量kg':'負担重量', '馬体重kg':'馬体重',
+                          '馬体重増減kg':'馬体重増減', '上がり3F':'上がり3F', '人気':'人気'
+                      }
+                      row.update({dest: r.get(src, '') for dest, src in race_map.items()})
+                      row.update({dest: h.get(src, '') for dest, src in horse_map.items()})
+                      row.update({'公式レース_' + k: v for k, v in r.items()})
+                      row.update({'公式出走_' + k: v for k, v in h.items()})
+                      rows.append(row)
+                  pays.extend(p for p in records(path, 'payback') if tuple(p[k] for k in KEY) in race_keys)
+              index = {(r['競馬場'], r['日付'].replace('-', ''), r['レース番号'], r['馬番']): r for r in rows}
+              odds_months = sorted({k[1][:6] for k in index if k[1] >= '20260301'})
+              odds_sources, odds_count, odds_seen = {}, 0, set()
+              stage = OUT / 'stage'
+              stage.mkdir(exist_ok=True)
+              with (stage / 'monbetsu_odds.csv').open('w', encoding='utf-8-sig', newline='') as f:
+                  w = csv.DictWriter(f, ODDS + ['オッズ時点'])
+                  w.writeheader()
+                  for m in odds_months:
+                      path, odds_sources[m] = fetch(m, 'odds', refresh_from)
+                      for o in records(path, 'odds'):
+                          key = tuple(o[k] for k in KEY)
+                          if key in race_keys:
+                              uid = key + tuple(o[k] for k in ODDS[3:7])
+                              if uid in odds_seen:
+                                  raise ValueError('オッズ重複')
+                              odds_seen.add(uid)
+                              w.writerow({**o, 'オッズ時点': '公式月次・確定'})
+                              odds_count += 1
+                          row = index.get(key + (o['番号1'],))
+                          if row and o['賭式'] in ('単勝', '複勝') and re.fullmatch(r'\d+(\.\d+)?', o['オッズ']) and float(o['オッズ']) > 0:
+                              if o['賭式'] == '単勝':
+                                  row['単勝オッズ'] = o['オッズ']
+                              elif re.fullmatch(r'\d+(\.\d+)?', o['オッズ（最大）']) and float(o['オッズ（最大）']) >= float(o['オッズ']):
+                                  row['複勝下限'], row['複勝上限'] = o['オッズ'], o['オッズ（最大）']
+                              else:
+                                  continue
+                              row['オッズ時点'], row['オッズ出典'] = '確定', odds_sources[m]['url']
+              legacy = ROOT / 'results.csv'
+              if legacy.exists():
+                  with legacy.open(encoding='utf-8-sig', newline='') as f:
+                      for old in csv.DictReader(f):
+                          if not all(old.get(k) for k in ['開催日', 'レース', '馬番', '馬名']):
+                              continue
+                          key = (
+                              '門別', old['開催日'].replace('-', ''),
+                              str(int(float(old['レース']))), str(int(float(old['馬番'])))
+                          )
+                          row = index.get(key)
+                          clean = lambda s: re.sub(r'^\[(J|大|佐|船|川|浦|岩|金|笠|愛|兵|高|北|帯)\]', '', norm(s))
+                          if not row or clean(old['馬名']) != clean(row['馬名']) or row['オッズ時点']:
+                              continue
+                          win = old.get('単勝オッズ', '')
+                          place = re.fullmatch(r'(\d+(?:\.\d+)?)\s*-\s*(\d+(?:\.\d+)?)', old.get('複勝オッズ範囲', ''))
+                          if re.fullmatch(r'\d+(\.\d+)?', win):
+                              row['単勝オッズ'] = win
+                          if place:
+                              row['複勝下限'], row['複勝上限'] = place[1], place[2]
+                          if row['単勝オッズ'] or row['複勝下限']:
+                              row['オッズ時点'], row['オッズ出典'] = '取得時点未検証', '既存results.csv・馬名照合済み'
+              rows.sort(key=lambda r: (r['日付'], r['競馬場'], int(r['レース番号']), int(r['馬番'])))
+              primary = [r for r in rows if r['データ区分'] == '門別本体']
+              expected = {
+                  tuple(r[k] for k in KEY)
+                  for path, _ in downloaded
+                  for r in records(path, 'racelist')
+                  if r['競馬場'] == '門別' and lower <= r['競走年月日'] <= upper
+              }
+              if expected != race_keys:
+                  raise ValueError('レース一覧と出走情報のキーが不一致です')
+              fields = list(rows[0]) if rows else []
+              fields += sorted(raw_fields - set(fields))
+              write_csv(stage / 'monbetsu_results.csv', rows, fields)
+              write_csv(stage / 'monbetsu_main.csv', primary, fields)
+              write_csv(stage / 'monbetsu_payback.csv', pays, list(pays[0]) if pays else KEY)
+              report = {
+                  'success': True,
+                  'as_of': cutoff.isoformat(),
+                  'rows': len(rows),
+                  'main_rows': len(primary),
+                  'history_rows': len(rows)-len(primary),
+                  'main_races': len(race_keys),
+                  'odds_rows': odds_count,
+                  'duplicates': 0,
+                  'missing_main': {
+                      k: sum(not r.get(k) for r in primary)
+                      for k in fields if not k.startswith('公式')
+                  },
+                  'sources': sources,
+                  'odds_sources': odds_sources,
+                  'limitations': [
+                      'ハロン別ラップ等は公式掲載分のみ。欠損は埋めない。',
+                      '中央の通常競走・調教・能力検査・発走前オッズは未補完。',
+                      '公式IDでなく照合用ID。追加履歴は対象馬・指定期間に限定。',
+                      '予想時は必ず対象日より前の履歴に限定する。'
+                  ]
+              }
+              save_json(stage / 'audit.json', report)
+              for p in stage.iterdir():
+                  os.replace(p, OUT / p.name)
+              (OUT / 'error.json').unlink(missing_ok=True)
+              print(json.dumps({
+                  k: v for k, v in report.items()
+                  if k not in ['sources', 'odds_sources', 'missing_main']
+              }, ensure_ascii=False, indent=2))
+
+          if __name__ == '__main__':
+              try:
+                  main()
+              except Exception as e:
+                  save_json(OUT / 'error.json', {'success': False, 'error': str(e)})
+                  raise
+          PY
+      - name: Save downloaded months
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: .nar-cache-v2
+          key: monbetsu-nar-v2-${{ github.run_id }}-${{ github.run_attempt }}
+      - name: Downloadable data
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: monbetsu-nar-${{ github.run_number }}
+          path: |
+            output/*.csv
+            output/*.json
+          if-no-files-found: error
+          retention-days: 30
